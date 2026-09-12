@@ -2,7 +2,9 @@
 
 This project documents the work needed to prepare a **Radxa Dragon Q8B** to run **Home Assistant OS in a KVM virtual machine** while keeping Debian as the host operating system.
 
-The project is still in progress. Home Assistant OS has **not yet been installed in the VM**. The difficult platform work has been the main focus so far: enabling KVM/EL2 without losing the Q8B audio DSP, fan control, and video hardware acceleration.
+The difficult platform work is now complete: the Q8B boots automatically into native EL2/VHE with KVM, Qualcomm ADSP/CDSP, audio, automatic fan control, and Iris VPU hardware video decoding all working together.
+
+Home Assistant OS itself has **not yet been installed**. That is the next project step.
 
 ## Hardware and software used
 
@@ -12,60 +14,48 @@ The project is still in progress. Home Assistant OS has **not yet been installed
 - NVMe SSD
 - Debian 13 (Trixie)
 - Radxa kernel baseline: `7.0.11-6-qcom`
-- BIOS updated to Radxa release `260825`
+- BIOS: Radxa release `260825`
+- BIOS `Hypervisor Override = Enabled`
 
-## Goal
-
-The planned Home Assistant VM is:
+## Planned Home Assistant VM
 
 - ARM64 Home Assistant OS
 - KVM acceleration
-- 4 vCPU
-- 8 GB RAM
-- 512 GB sparse `qcow2` disk
+- **6 vCPU**
+- **8 GB RAM**
+- **512 GB sparse qcow2** disk
 - UEFI boot
 - bridged Ethernet
-
-The VM itself is intentionally the next step. We first wanted the host platform to be stable with KVM enabled.
+- VM autostart
 
 ---
 
-# What we learned and did
+# Platform bring-up
 
-## 1. Install Debian on the Q8B
+## 1. Debian baseline
 
 Debian Trixie was installed on NVMe and used as the normal desktop/host OS.
 
-Basic hardware such as Ethernet, Wi-Fi, Bluetooth, display, audio and fan control worked in the normal boot mode.
+In the normal EL1 boot configuration the basic hardware worked, including Ethernet, Wi-Fi, Bluetooth, display, audio, fan control, and Iris video decoding.
 
-The stock kernel used during the first tests was:
+Stock kernel:
 
 ```bash
 uname -r
 # 7.0.11-6-qcom
 ```
 
-## 2. Install the virtualization tools
+## 2. Enable EL2 / KVM
 
 KVM/QEMU/libvirt/virt-manager were installed on Debian.
 
-The important check is:
+BIOS was updated to `260825`, then:
 
-```bash
-ls -l /dev/kvm
+```text
+Hypervisor Override = Enabled
 ```
 
-With the BIOS in its normal/automatic hypervisor mode, `/dev/kvm` was not available.
-
-## 3. Enable EL2 in BIOS
-
-BIOS was updated to `260825`.
-
-Then:
-
-- BIOS -> **Hypervisor Override** -> **Enabled**
-
-Linux then booted at EL2 and KVM initialized successfully:
+Linux then enters EL2 and KVM initializes successfully:
 
 ```text
 kvm [1]: VHE mode initialized successfully
@@ -77,29 +67,22 @@ and:
 ls -l /dev/kvm
 ```
 
-showed the KVM device.
+shows the KVM device.
 
-### New problem
+### The first EL2 problem
 
-With EL2 enabled, the Qualcomm ADSP and CDSP remote processors stopped starting correctly.
-
-Typical errors were:
+With EL2 enabled, the Qualcomm ADSP and CDSP remote processors failed through the normal PAS path:
 
 ```text
 qcom_q6v5_pas ... error -22 initializing firmware ...qcadsp8280.mbn
 qcom_q6v5_pas ... error -22 initializing firmware ...qccdsp8280.mbn
 ```
 
-This caused two visible problems:
+This also broke audio and automatic fan control.
 
-- audio stopped working
-- automatic fan control stopped working
+## 3. Understand the Q8B boot chain
 
-So simply enabling KVM was not enough.
-
-## 4. Understand the Q8B boot chain
-
-The active Q8B boot chain was found to be:
+The original boot chain was:
 
 ```text
 Qualcomm UEFI
@@ -109,66 +92,47 @@ Qualcomm UEFI
   -> Linux kernel + initrd + DTB
 ```
 
-The important discovery was that Radxa's `embloader` is not the normal Debian `systemd-boot` implementation and does not automatically load EFI drop-in drivers from:
+Radxa's `embloader` is not normal Debian systemd-boot and does not automatically load EFI drop-in drivers from:
 
 ```text
 /EFI/systemd/drivers/
 ```
 
-The existing fallback bootloader was kept untouched for recovery.
+The original fallback loader was kept untouched for recovery.
 
-## 5. Chainload real Debian systemd-boot
+## 4. Add real Debian systemd-boot
 
-A separate copy of Debian's real systemd-boot was added without replacing the Radxa bootloader:
+A separate copy of Debian systemd-boot was installed as:
 
 ```text
 /EFI/systemd/systemd-boot-real-aa64.efi
 ```
 
-A BLS entry was then used to chainload it from the Radxa boot menu.
+During development it was chainloaded from embloader. Once the platform was proven stable, a dedicated UEFI boot entry was created so Qualcomm UEFI can start it directly.
 
-This gave a safe two-stage boot path:
+The original files remain untouched:
 
 ```text
-Radxa embloader
-  -> real Debian systemd-boot
-  -> test kernel / DTB
+/EFI/BOOT/BOOTAA64.EFI
+/EFI/systemd/systemd-bootaa64.efi
 ```
 
-This was important because real systemd-boot supports EFI driver autoloading.
-
-## 6. Use qebspil to start Qualcomm DSPs before Linux
+## 5. Use qebspil for ADSP/CDSP
 
 We used:
 
 - project: `stephan-gh/qebspil`
 - tested commit: `8e4d9e676a3b3afe136cda9b953a2139ff1a32d0`
 
-The EFI driver was installed as:
+EFI driver:
 
 ```text
 /boot/efi/EFI/systemd/drivers/qebspilaa64.efi
 ```
 
-The ADSP and CDSP firmware files were also staged on the EFI System Partition so qebspil could load them before Linux.
+The tested configuration uses qebspil only for the required Qualcomm remote processors. It is **not** built with `QEBSPIL_ALWAYS_START=1`.
 
-ADSP firmware:
-
-```text
-/firmware/qcom/sc8280xp/radxa/dragon-q8b/qcadsp8280.mbn
-```
-
-CDSP firmware:
-
-```text
-/firmware/qcom/sc8280xp/qccdsp8280.mbn
-```
-
-## 7. Create an EL2-specific DTB
-
-A custom EL2 device tree was created from the normal Q8B DTB plus the Radxa EL2 overlay.
-
-The qebspil-specific change marks the ADSP and CDSP remote processors with:
+The Q8B EL2 device-tree overlay marks ADSP and CDSP for takeover:
 
 ```dts
 &remoteproc_adsp {
@@ -180,113 +144,145 @@ The qebspil-specific change marks the ADSP and CDSP remote processors with:
 };
 ```
 
-The normal DTB was left unchanged.
+After Linux boots, they attach to the already running processors:
 
-## 8. Patch the kernel remoteproc attach path
+```text
+remoteproc0: adsp = attached
+remoteproc1: cdsp = attached
+```
 
-The Radxa kernel already contained support for attaching to remote processors that were started before Linux.
+Audio works and the automatic fan controller works again.
 
-One missing part was found in the Qualcomm minidump remoteproc operations used by ADSP: the attach callback was missing.
+The fan hwmon device is:
 
-The custom kernel work used:
+```text
+radxa_svc_glink
+```
 
-- Radxa packaging repo: `radxa-pkg/linux-qcom`
-- package tag: `7.0.11-6`
-- kernel source commit used during testing: `657c0f722940cd9d3b51abfa7383655ec7d2c795`
-- custom kernel version: `7.0.11-6+q8bel2.1-qcom`
+with automatic mode:
 
-The local commits were:
+```text
+pwm1_enable = 2
+```
+
+## 6. Kernel remoteproc attach fix
+
+The Radxa kernel already had most of the required pre-started remoteproc handoff support, but the Qualcomm minidump remoteproc operations used by ADSP were missing the attach callback.
+
+Local kernel commits used during the bring-up:
 
 ```text
 13227941a903  remoteproc minidump attach fix
 4eb7a4ca155b  Q8B qebspil EL2 overlay
 ```
 
-## 9. Successful EL2 + KVM + DSP boot
-
-The working boot sequence became:
+The first working KVM + DSP kernel was:
 
 ```text
-BIOS Hypervisor Override = Enabled
-  -> Radxa embloader
-  -> REAL systemd-boot
-  -> Q8B EL2 qebspil test entry
-  -> custom kernel + EL2 DTB
+7.0.11-6+q8bel2.1-qcom
 ```
 
-The result:
-
-```bash
-uname -r
-# 7.0.11-6+q8bel2.1-qcom
-```
-
-KVM works:
-
-```bash
-ls -l /dev/kvm
-```
-
-ADSP and CDSP attach instead of failing:
+This established the first major milestone:
 
 ```text
-remoteproc0: attaching to adsp
-remoteproc0: remote processor adsp is now attached
-remoteproc1: attaching to cdsp
-remoteproc1: remote processor cdsp is now attached
+EL2/VHE + KVM + ADSP/CDSP + audio + automatic fan control
 ```
 
-Audio works again.
+---
 
-Automatic fan control works again. The fan hwmon device appears as:
+# Iris VPU under EL2
 
-```text
-radxa_svc_glink
-```
+## 7. Why Iris originally failed
 
-and automatic mode is:
-
-```text
-pwm1_enable = 2
-```
-
-This was the first important milestone: **KVM, audio and fan control working together at EL2.**
-
-## 10. Remaining EL2 problem: Iris video firmware
-
-The Qualcomm Iris VPU still fails to start under EL2.
-
-The error is:
+After ADSP/CDSP were fixed, the Qualcomm Iris VPU still failed under EL2:
 
 ```text
 qcom-iris aa00000.video-codec: error -22 initializing firmware qcom/vpu/vpu20_p4_gen2_s6.mbn
 ```
 
-The failure happens in the Qualcomm PAS firmware initialization path for **PAS ID 9**.
-
-This problem is still open.
-
-Important: this is separate from ADSP/CDSP. KVM, audio and fan control are already working under EL2.
-
-## 11. Test the Iris VPU in normal EL1 mode
-
-To understand whether the VPU hardware itself was working, the machine was booted in the normal EL1 configuration.
-
-In EL1 the Iris decoder starts correctly and appears as:
+The failure occurred before firmware authentication/reset in the Qualcomm PAS path for:
 
 ```text
-/dev/video0
+IRIS_PAS_ID = 9
+```
+
+The same Iris hardware and firmware worked correctly in EL1, so this was an EL2/PAS integration problem rather than a hardware failure.
+
+qebspil was deliberately **not** extended to Iris/PAS 9.
+
+## 8. Non-TZ Iris firmware boot
+
+The working solution follows the Qualcomm native-EL2/non-TZ firmware model used on compute platforms:
+
+- detect a `video-firmware` child node
+- use `qcom_mdt_load_no_init()` instead of PAS 9
+- create a dedicated firmware-context IOMMU domain
+- map the Iris firmware region into that domain
+- perform the Iris/Xtensa reset sequence directly
+- bypass PAS authentication/reset/memory-protection calls in non-TZ mode
+- tear down the firmware IOMMU mapping on unload
+
+The Q8B EL2 device tree adds:
+
+```dts
+&iris {
+    video-firmware {
+        iommus = <&apps_smmu 0x2a02 0x400>;
+    };
+};
+```
+
+The EL2 DTB composition therefore contains both:
+
+- qebspil ADSP/CDSP handoff
+- Iris non-TZ firmware context
+
+The Iris implementation was committed locally as:
+
+```text
+15633b765056c03d71dee501b8cc83b2ed6ff500
+media: iris: support non-TZ firmware boot on Q8B EL2
+```
+
+The resulting test package/kernel is:
+
+```text
+linux-image-7.0.11-6+q8bel2.2-qcom
+7.0.11-6+q8bel2.2-qcom
+```
+
+During boot the dedicated firmware device is visible in its own IOMMU group:
+
+```text
+platform video-firmware.0: Adding to iommu group 31
+```
+
+The old Iris PAS 9 `-22` error is gone.
+
+## 9. Iris decoder is available at EL2
+
+With the `.2` kernel:
+
+```text
+/dev/video0  qcom-iris-decoder
+/dev/video1  qcom-iris-encoder
+```
+
+and the decoder is provided by:
+
+```text
+qcom-iris
 iris_driver
 Iris Decoder
 ```
 
-A 4K HEVC Main10 test file was then used.
+---
 
-The hardware decoder opened correctly, but FFmpeg failed when the decoder switched its capture format from NV12 to P010.
+# FFmpeg P010 support
 
-## 12. Find missing P010 support in FFmpeg 7.1.5 V4L2M2M
+## 10. Missing P010 support in FFmpeg 7.1.5 V4L2M2M
 
-Two missing pieces were found in FFmpeg 7.1.5.
+A 4K HEVC Main10 test stream exposed two missing pieces in FFmpeg 7.1.5.
 
 ### Fix 1 - map V4L2 P010 to FFmpeg P010LE
 
@@ -296,7 +292,7 @@ In:
 libavcodec/v4l2_fmt.c
 ```
 
-we added:
+we add:
 
 ```c
 #ifdef V4L2_PIX_FMT_P010
@@ -304,132 +300,187 @@ we added:
 #endif
 ```
 
-Without this mapping, Iris could return P010 but FFmpeg could not represent the format correctly.
-
 ### Fix 2 - handle single-memory-plane P010 like NV12
 
-Iris exposes P010 as one V4L2 memory buffer containing two image planes: Y followed by interleaved UV.
+Iris exposes P010 as one V4L2 memory buffer containing the Y plane followed by interleaved UV.
 
-FFmpeg already handled this layout for NV12/NV21, but not P010.
-
-In:
-
-```text
-libavcodec/v4l2_buffers.c
-```
-
-we added:
+FFmpeg already handled that layout for NV12/NV21. The same pointer/stride fixup is also needed for:
 
 ```c
 case AV_PIX_FMT_P010LE:
 ```
 
-to the existing NV12/NV21 special case.
-
-This gives the second P010 image plane a valid data pointer and line stride.
-
-The complete minimal FFmpeg patch is included in:
+The minimal verified patch is included here:
 
 ```text
 patches/ffmpeg-7.1.5-v4l2m2m-p010.patch
 ```
 
-## 13. Build a local patched FFmpeg
+We deliberately do **not** replace Debian's system FFmpeg libraries. The patched `libavcodec.so.61` is used locally for testing/mpv.
 
-We deliberately did not replace Debian's FFmpeg packages.
+A later experimental V4L2 `.flush` full-reinitialization patch was tested and rejected. It is intentionally not included here.
 
-The source was cloned from FFmpeg `n7.1.5`, patched locally and built separately.
+## 11. HEVC Main10 hardware decoding works under EL2
 
-Example:
-
-```bash
-git clone --depth 1 --branch n7.1.5 \
-  https://github.com/FFmpeg/FFmpeg.git \
-  ~/src/ffmpeg-7.1.5-p010
-```
-
-A shared `libavcodec.so.61` was then built and tested with Debian's existing mpv using `LD_PRELOAD`.
-
-## 14. Hardware HEVC Main10 decoding now works in mpv
-
-The patched library is loaded only for the test process:
-
-```bash
-LD_PRELOAD="$HOME/src/ffmpeg-7.1.5-p010/build-shared/libavcodec/libavcodec.so.61" \
-mpv \
-  --no-config \
-  --vo=gpu \
-  --gpu-api=opengl \
-  --hwdec=v4l2m2m-copy \
-  VIDEO_FILE
-```
-
-The important mpv output is now:
+The final `.2` EL2 kernel successfully opens the Iris hardware decoder through FFmpeg:
 
 ```text
-Using hardware decoding (v4l2m2m-copy).
-VO: [gpu] 3840x2160 p010
+Using device /dev/video0
+driver 'iris_driver' on card 'Iris Decoder' in mplane mode
+requesting formats: output=HEVC/none capture=NV12/yuv420p10le
 ```
 
-Longer playback remained synchronized and stable:
+The decoder outputs P010 at 3840x2160.
+
+A 10-second 4K HEVC Main10 hardware decode test completed with:
 
 ```text
-A-V: 0.000
+240 frames
+~8.47x realtime
 ```
 
-The fan also remained at low speed, which is consistent with the video being decoded by the Iris hardware decoder instead of the CPU.
+No Iris PAS 9 firmware failure, `firmware download failed`, or Iris IOMMU fault appeared.
 
-No test media filenames are included in this repository.
+The FFmpeg/V4L2 path did report one recoverable capture-buffer initialization/decode error during startup, but decoding continued and completed the requested 240 output frames. This remains worth monitoring during longer playback, but it no longer blocks the KVM/Home Assistant platform.
+
+No test-media filenames are included in this repository.
+
+---
+
+# Automatic production boot
+
+## 12. Direct UEFI boot to real systemd-boot
+
+During development the working path required manual selection through embloader and then real systemd-boot.
+
+That is no longer required.
+
+A dedicated UEFI entry was created for:
+
+```text
+\EFI\systemd\systemd-boot-real-aa64.efi
+```
+
+Example command used on this machine:
+
+```bash
+sudo efibootmgr -C \
+  -d /dev/nvme0n1 \
+  -p 2 \
+  -L "Q8B real systemd-boot" \
+  -l '\EFI\systemd\systemd-boot-real-aa64.efi'
+```
+
+The entry was first tested safely with `BootNext`, then made permanent only after the automatic boot was verified.
+
+On the tested machine the final UEFI order is:
+
+```text
+BootOrder: 0005,0004
+Boot0005: Q8B real systemd-boot
+Boot0004: BootManagerMenuApp
+```
+
+The numeric IDs are firmware-instance-specific and should **not** be copied blindly to another machine.
+
+The `.2` BLS entry is the persistent systemd-boot default:
+
+```text
+RadxaOS-7.0.11-6+q8bel2.2-qcom.conf
+```
+
+while `loader.conf` deliberately still contains the stock kernel as the file-based recovery default:
+
+```text
+timeout 10
+#console-mode keep
+default RadxaOS-7.0.11-6-qcom.conf
+```
+
+The resulting normal boot path is now:
+
+```text
+Qualcomm UEFI
+  -> Q8B real systemd-boot UEFI entry
+  -> systemd-boot 257.13
+  -> qebspil EFI driver
+  -> 7.0.11-6+q8bel2.2-qcom
+  -> EL2/VHE + KVM
+```
+
+Automatic reboot and cold-boot operation were validated without manually selecting a boot entry.
+
+A successful platform verification shows:
+
+```text
+Kernel:       7.0.11-6+q8bel2.2-qcom
+Boot loader:  systemd-boot-real-aa64.efi
+KVM:          /dev/kvm present
+VHE:          initialized successfully
+ADSP:         attached
+CDSP:         attached
+qebspil:      loaded
+```
 
 ---
 
 # Current status
 
-| Feature | EL1 / normal boot | EL2 / KVM boot |
+| Feature | EL1 / stock boot | EL2 / production test boot |
 |---|---|---|
 | Debian desktop | Working | Working |
-| KVM `/dev/kvm` | No | Working |
-| ADSP | Working | Working with qebspil + custom kernel |
-| CDSP | Working | Working with qebspil + custom kernel |
-| Audio | Working | Working |
-| Automatic fan control | Working | Working |
-| Iris VPU firmware | Working | **PAS 9 error -22** |
-| HEVC 10-bit hardware decode | Working with FFmpeg P010 patch | Not yet, because Iris PAS 9 fails |
-| Home Assistant OS VM | Not created yet | Next milestone |
+| KVM `/dev/kvm` | No | **Working** |
+| VHE | No | **Working** |
+| ADSP | Working | **Working via qebspil + attach** |
+| CDSP | Working | **Working via qebspil + attach** |
+| Audio | Working | **Working** |
+| Automatic fan control | Working | **Working** |
+| Iris VPU firmware | Working | **Working via non-TZ firmware boot** |
+| HEVC Main10 hardware decode | Working with P010 patch | **Working with P010 patch** |
+| Automatic unattended boot | Stock path | **Working** |
+| Home Assistant OS VM | Not installed | **Next milestone** |
 
-# Important recovery/safety notes
+# Recovery / safety notes
 
-During development we kept the original boot path available.
-
-Recommended rules:
+The recovery path was intentionally preserved throughout development.
 
 - Do not overwrite `/EFI/BOOT/BOOTAA64.EFI`.
-- Keep the original Radxa boot entry available.
-- Keep the stock kernel/DTB as a recovery entry.
-- Do not modify `extlinux.conf`; it was not the active boot path in this setup.
-- Keep the custom EL2 test entry separate from the normal boot entry.
-- BIOS **Hypervisor Override = Auto** plus the stock boot entry is the recovery path.
-- Do not force the fan PWM manually when `pwm1_enable=2`; that is automatic mode.
+- Do not overwrite the Radxa embloader `/EFI/systemd/systemd-bootaa64.efi`.
+- Keep `/EFI/systemd/systemd-boot-real-aa64.efi` separate.
+- Keep the stock kernel and normal Q8B DTB installed.
+- Keep the stock BLS entry available.
+- Keep the firmware Boot Manager entry available after the direct systemd-boot entry.
+- Do not manually edit `extlinux.conf`; it is not the active normal boot path used here.
+- BIOS `Hypervisor Override = Auto` plus the stock kernel remains the EL1 recovery configuration.
+- Do not manually force fan PWM while `pwm1_enable=2`; that is automatic fan mode.
 
 # Next step: Home Assistant OS VM
 
-Now that the EL2/KVM platform works with audio and fan control, the next project step is to create the Home Assistant OS ARM64 virtual machine.
+The host platform is now considered ready for the Home Assistant stage.
 
-Planned configuration:
+Planned VM configuration:
 
 ```text
-4 vCPU
-8 GB RAM
-512 GB sparse qcow2
-UEFI
-KVM
-bridged Ethernet
+Architecture: ARM64
+Acceleration: KVM
+CPU:          6 vCPU
+RAM:          8 GB
+Disk:         512 GB sparse qcow2
+Firmware:     UEFI
+Network:      bridged Ethernet
+Autostart:    enabled
 ```
 
-Before making this the permanent configuration, the remaining Iris/PAS 9 EL2 issue should be documented and ideally solved so the Debian host keeps hardware video decoding while KVM is enabled.
+The next work is:
+
+1. create a NetworkManager bridge on the wired Ethernet interface while keeping Wi-Fi available as a recovery path
+2. validate libvirt/KVM networking
+3. create the Home Assistant OS ARM64 VM
+4. enable VM autostart
+5. validate reboot/power-loss recovery of the complete host + VM stack
 
 # Project status
 
-**Experimental / work in progress.**
+**Platform bring-up complete; Home Assistant VM installation next.**
 
-This repository records a real Q8B bring-up and the fixes that were verified on the hardware. It is not yet a one-command installer.
+This repository records fixes that were actually tested on the hardware. It is not yet a one-command installer and the custom kernel changes are still experimental/local engineering work rather than an upstream-supported Q8B configuration.
