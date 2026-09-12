@@ -1,0 +1,8 @@
+# Copy this file to /etc/default/haos-usb-attach and replace the placeholders
+# with the unique USB serial numbers reported by /dev/serial/by-id or sysfs.
+
+VM=haos
+URI=qemu:///system
+
+ZWAVE_SERIAL=REPLACE_WITH_ZWAVE_CP2102N_SERIAL
+RFXCOM_SERIAL=REPLACE_WITH_RFXCOM_CP2102N_SERIAL
