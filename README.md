@@ -23,6 +23,11 @@ Verified on 2026-09-12:
 - VirtIO disk and network
 - bridged LAN networking
 - libvirt autostart enabled
+- Bluetooth USB passthrough working and persistent
+- Z-Wave USB passthrough working through serial-number based systemd attach
+- RFXCOM USB passthrough working through serial-number based systemd attach
+- identical CP2102N adapters survive changing host USB device numbers across reconnect/reboot
+- physical Q8B CPU temperature exported from Debian to HAOS through a persistent local HTTP service
 - VM reboot verified
 - complete Q8B host reboot verified
 
@@ -222,6 +227,47 @@ The VM was created with `virt-install`, AAVMF UEFI, `host-passthrough` CPU mode,
 
 After validation, libvirt autostart was enabled.
 
+## USB passthrough
+
+Three USB devices are used by HAOS:
+
+```text
+Bluetooth   13d3:3570
+Z-Wave      Silicon Labs CP2102N 10c4:ea60
+RFXCOM      Silicon Labs CP2102N 10c4:ea60
+```
+
+Bluetooth has a unique VID:PID and is persisted directly in the libvirt domain definition.
+
+The Z-Wave and RFXCOM adapters are more interesting because both expose the same `10c4:ea60` VID:PID. Host USB device numbers also change after disconnect/reconnect and host reboot, so static bus/device assignments are not reliable.
+
+The verified production solution is a systemd service/timer that identifies each adapter from its unique USB serial number, discovers its current bus/device numbers, and live-attaches it to the HAOS VM. The timer runs approximately every 30 seconds and therefore also provides self-recovery after reconnect or VM restart.
+
+This was verified with live-detach tests and then with a complete Q8B host reboot. The adapters received different host USB device numbers after reboot but were still correctly identified and attached to HAOS.
+
+## Physical host CPU temperature in Home Assistant
+
+A `command_line` sensor inside HAOS cannot directly read the Debian host's physical `/sys/class/thermal` sensors because HAOS runs in a VM.
+
+The Q8B CPU aggregate sensors are identified by thermal type:
+
+```text
+cluster0-thermal
+cluster1-thermal
+```
+
+A persistent Debian systemd service exports both values over a small read-only HTTP endpoint on port 9101 and reports the higher cluster temperature as the overall CPU value.
+
+Example payload:
+
+```json
+{"cpu":41.8,"cluster0":40.8,"cluster1":41.8}
+```
+
+Home Assistant reads the endpoint with a REST sensor. The implementation deliberately searches thermal zones by `type` rather than hard-coding a `thermal_zoneN` number, since zone numbering can change across kernel/device-tree revisions.
+
+See [HAOS-KVM.md](HAOS-KVM.md) for the tested service layout, REST configuration and USB persistence details.
+
 Both of the following were tested successfully:
 
 1. reboot of the HAOS VM
@@ -236,11 +282,14 @@ vnet0     forwarding under br0
 libvirtd  active
 haos      running
 autostart enabled
+Bluetooth passed through
+Z-Wave attached by serial-number service
+RFXCOM attached by serial-number service
 HAOS ping working
 HAOS HTTP 200
 ```
 
-See [HAOS-KVM.md](HAOS-KVM.md) for the exact deployment procedure and commands.
+The HAOS network responds before the Home Assistant frontend has necessarily completed startup, so HTTP may become available slightly later than ping.
 
 ---
 
@@ -272,7 +321,7 @@ The recovery path was intentionally preserved throughout development.
 - BIOS `Hypervisor Override = Auto` plus the stock kernel remains the EL1 recovery configuration.
 - Do not manually force fan PWM while `pwm1_enable=2`; that is automatic fan mode.
 - Keep an independent recovery network path while converting Ethernet to a bridge.
-- NetworkManager UUIDs, DHCP addresses, VM MAC addresses and UEFI boot IDs are installation-specific and should be discovered locally rather than copied blindly.
+- NetworkManager UUIDs, DHCP addresses, VM MAC addresses, USB serial numbers and UEFI boot IDs are installation-specific and should be discovered locally rather than copied blindly.
 
 ---
 
@@ -280,6 +329,6 @@ The recovery path was intentionally preserved throughout development.
 
 **Platform bring-up and Home Assistant OS KVM deployment complete.**
 
-The complete host + bridge + libvirt + HAOS stack has been tested successfully across both VM reboot and full Q8B host reboot.
+The complete host + bridge + libvirt + HAOS stack has been tested successfully across both VM reboot and full Q8B host reboot. USB passthrough for Bluetooth, Z-Wave and RFXCOM is also reboot-tested, including recovery of two identical CP2102N adapters by unique serial number. Physical Q8B CPU temperature reporting into Home Assistant is persistent through a Debian systemd HTTP service.
 
 This repository records fixes and procedures that were actually tested on the hardware. It is not a one-command installer, and the custom kernel/Iris work remains engineering work rather than an upstream-supported Radxa Q8B Home Assistant configuration.
