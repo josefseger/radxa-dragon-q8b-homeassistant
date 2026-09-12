@@ -1,0 +1,9 @@
+[Unit]
+Description=Attach HAOS USB serial dongles by unique serial number
+After=libvirtd.service
+Wants=libvirtd.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/default/haos-usb-attach
+ExecStart=/usr/local/sbin/haos-usb-serial-attach.sh
