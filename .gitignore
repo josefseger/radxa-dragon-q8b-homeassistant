@@ -1,0 +1,7 @@
+*.log
+*.qcow2
+*.img
+*.iso
+*.mbn
+build/
+build-*/
